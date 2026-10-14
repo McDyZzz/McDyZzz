@@ -34,18 +34,26 @@ cd src
 
 ## Theme and width switching
 
-Each themed image is a `<picture>`. The browser takes the first matching source:
+Each themed image is two `<picture>`s: a phone one, then a desktop one. Each starts with a width-only source to `assets/blank.svg` (0×0), so only one of the two shows. The browser takes the first matching source:
 
 ```html
 <picture>
-  <source media="(max-width: 1011px) and (prefers-color-scheme: dark)" srcset="assets/X-phone-dark.svg">
-  <source media="(max-width: 1011px)" srcset="assets/X-phone-light.svg">
+  <source media="(min-width: 1012px)" srcset="assets/blank.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/X-phone-dark.svg">
+  <img src="assets/X-phone-light.svg" alt="...">
+</picture><picture>
+  <source media="not all and (min-width: 1012px)" srcset="assets/blank.svg">
   <source media="(prefers-color-scheme: dark)" srcset="assets/X-dark.svg">
   <img src="assets/X-light.svg" alt="...">
 </picture>
 ```
 
-- Phone layout: window width 1011 px or less. At 375 px the README content is 293 px wide.
+- In `README.md` each pair sits on one line with no whitespace anywhere, so the blank image shares the shown image's line and adds no height.
+- Each pair of width gates is the exact complement of one boundary (`(min-width: N)` and `not all and (min-width: N)`), so a fractional window width, such as 1011.5 px under page zoom, shows exactly one picture of a pair.
+- Each media query holds one condition: a width or a theme, never both. For a signed-in viewer with an explicit light or dark theme, GitHub's `<themed-picture>` rewrites every source whose media holds `prefers-color-scheme` to always match or never match, and drops the rest of that query.
+- Both pictures of a pair carry the same alt text.
+- Card back: one picture with `not all and (min-width: 1280px)` → blank, `(prefers-color-scheme: dark)` → dark, `(min-width: 1280px)` → light, and `<img src="assets/blank.svg" alt="">`.
+- Phone layout: window width below 1012 px. At 375 px the README content is 293 px wide.
 - Desktop layout: at 1280 px the README content is 846 px wide.
 - Images carry no width attribute, so each one shows at its SVG's own size, capped at the content width.
 

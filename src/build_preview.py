@@ -11,6 +11,9 @@ Each frame resolves every <picture> the way the browser would for that window wi
 the first <source> whose media query matches wins, else the <img> src. The <img> keeps its own
 attributes (width, alt), so sizing and wrapping match GitHub. The viewer's own screen size and OS
 theme have no effect.
+Each themed image is two adjacent pictures, a phone one and a desktop one; the one for the other
+layout resolves to assets/blank.svg and renders 0x0. The card back resolves to blank.svg below
+1280 px. So a desktop frame shows 8 images from the pictures, a phone frame 7.
 """
 import html
 import pathlib
@@ -43,7 +46,10 @@ FEATURE = re.compile(r'\(\s*(min-width|max-width|prefers-color-scheme)\s*:\s*([^
 
 
 def matches(media, window, theme):
-    """Evaluates a media query made of (min-width), (max-width) and (prefers-color-scheme) joined by 'and'."""
+    """Evaluates a media query made of (min-width), (max-width) and (prefers-color-scheme) joined by 'and',
+    optionally negated as a whole by a leading 'not all and'."""
+    if media.startswith('not all and '):
+        return not matches(media[len('not all and '):], window, theme)
     rest = FEATURE.sub('', media).replace('and', '').strip()
     assert not rest, 'unsupported media query: ' + media
     for name, value in FEATURE.findall(media):
@@ -77,15 +83,19 @@ def resolve(body, window, theme):
 
 
 body = render(ROOT / "README.md")
-assert body.count("<picture>") == 8, "expected 8 pictures"
+assert body.count("<picture>") == 15, "expected 15 pictures"
+SHOWN = {1280: 8, 375: 7}   # pictures that resolve to a real image (not blank.svg), per window width
 
 frames = []
 for name, label, window, width, theme in FRAMES:
+    resolved = resolve(body, window, theme)
+    shown = len(re.findall(r'<picture><img [^>]*src="(?!assets/blank\.svg")', resolved))
+    assert shown == SHOWN[window], '%s: %d pictures show an image, expected %d' % (name, shown, SHOWN[window])
     frames.append(
         '<section class="col %s" id="%s"><div class="label">%s</div>'
         '<div class="frame" style="--w:%dpx"><div class="bar">McDyZzz / README.md</div>'
         '<article class="markdown-body">%s</article></div></section>'
-        % (theme, name, label, width, resolve(body, window, theme)))
+        % (theme, name, label, width, resolved))
 
 page = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">

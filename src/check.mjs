@@ -17,9 +17,14 @@
 //    no sideways scroll, no markdown headings, the easter egg's <summary> on one line with its image
 //    on the text baseline (where the disclosure triangle sits). Screenshots go to shots/<frame>.png (2x).
 // 2. Real README markup (gh api markdown, with every <source> kept) in a page that sizes the README
-//    like GitHub does: at window widths 1280 and 375, light and dark, each <picture> must pick the
-//    expected file (img.currentSrc). GitHub must keep the summary's <picture> inside <summary>; a
-//    click on the summary opens the details and shows the reveal image, a second click closes it.
+//    like GitHub does. GitHub must wrap each <picture> in <themed-picture>, and the page runs a copy of
+//    that element's source rewrite (THEMED_PICTURE) for data-color-mode auto, light and dark. At window
+//    widths 1280, 375, 1011.5 and 1279.5, OS theme light and dark, in each mode: each phone/desktop
+//    picture pair shows exactly one image, the expected file for that width and theme (img.currentSrc);
+//    every blank.svg image is 0x0 and shares its line with a shown image, so it adds no height; the
+//    card back shows from 1280 px only. The fractional widths (page zoom or display scaling) sit between
+//    two whole-pixel gates; the page loads in an iframe under CSS zoom 2 to get them (loadFramed). GitHub must keep the summary's <picture>s inside <summary>; a click on the
+//    summary opens the details and shows the reveal image, a second click closes it.
 // 3. Motion: each card SVG, shown through <img> as GitHub does, must look different in two
 //    screenshots taken 1 s apart, and identical under prefers-reduced-motion: reduce.
 // 4. Mirror symmetry of the device icons: each effect token of the idevice-control cards (ids
@@ -47,8 +52,9 @@ import { spawn, execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
 const ASSETS = path.join(ROOT, 'assets');
 const LOCAL = path.join(HERE, 'local');
@@ -153,16 +159,36 @@ async function chrome(port, extra = []) {
   });
   const send = (method, params = {}) => new Promise((res, rej) => { const i = ++id; pending.set(i, { res, rej }); ws.send(JSON.stringify({ id: i, method, params })); });
   await send('Page.enable');
+  let ctx, frameDir;   // ctx: the execution context eval() runs in; undefined = the top page
+  const media = (scheme, motion) => send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }, { name: 'prefers-reduced-motion', value: motion }] });
+  const navigate = async (url) => {
+    const loaded = new Promise((res) => waiters.push({ method: 'Page.loadEventFired', res }));
+    await send('Page.navigate', { url });
+    await loaded; await sleep(400);
+  };
   return {
     async load(url, width, scheme, dpr = 1, motion = 'reduce', height = 900) {
+      ctx = undefined;
       await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: dpr, mobile: false });
-      await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }, { name: 'prefers-reduced-motion', value: motion }] });
-      const loaded = new Promise((res) => waiters.push({ method: 'Page.loadEventFired', res }));
-      await send('Page.navigate', { url });
-      await loaded; await sleep(400);
+      await media(scheme, motion);
+      await navigate(url);
+    },
+    // Loads url in an iframe `width` CSS px wide under CSS zoom 2. Chrome hands an iframe's zoom to its
+    // document as page zoom, so the framed page's viewport is exactly `width` CSS px, fractions included
+    // (2 x width must be a whole number). Later eval() calls run in the framed document.
+    async loadFramed(url, width, scheme, motion = 'reduce', height = 900) {
+      ctx = undefined;
+      frameDir ??= mkdtempSync(path.join(tmpdir(), 'frame-'));
+      const wrap = path.join(frameDir, 'frame.html');
+      writeFileSync(wrap, `<!doctype html><html><body style="margin:0"><iframe src="${url}" style="zoom:2;display:block;border:0;width:${width}px;height:${height}px"></iframe></body></html>`);
+      await send('Emulation.setDeviceMetricsOverride', { width: Math.ceil(width * 2) + 40, height: height * 2 + 40, deviceScaleFactor: 1, mobile: false });
+      await media(scheme, motion);
+      await navigate('file://' + wrap);
+      const frameId = (await send('Page.getFrameTree')).frameTree.childFrames[0].frame.id;
+      ctx = (await send('Page.createIsolatedWorld', { frameId, worldName: 'check' })).executionContextId;
     },
     async eval(expr) {
-      const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true });
+      const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true, ...(ctx ? { contextId: ctx } : {}) });
       if (r.exceptionDetails) throw new Error(JSON.stringify(r.exceptionDetails));
       return r.result.value;
     },
@@ -175,13 +201,16 @@ async function chrome(port, extra = []) {
   };
 }
 
-// The <summary> of the easter egg: its height must be one line, and the image's bottom edge must sit
-// on the text baseline (a zero-size inline-block probe marks it), where the disclosure triangle sits.
+// The <summary> of the easter egg: its height must be one line, and the shown image's bottom edge must
+// sit on the text baseline (a zero-size inline-block probe marks it), where the disclosure triangle sits.
+// The summary holds a phone and a desktop picture; the widest image is the one shown.
 const summaryLine = `((s) => {
-  const q = s.getBoundingClientRect(), img = s.querySelector('img').getBoundingClientRect();
+  const q = s.getBoundingClientRect();
+  const el = [...s.querySelectorAll('img')].sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
+  const img = el.getBoundingClientRect();
   const probe = document.createElement('span'); probe.style.cssText = 'display:inline-block;width:0;height:0';
   s.append(probe); const base = probe.getBoundingClientRect().bottom; probe.remove();
-  return { h: q.height, lh: parseFloat(getComputedStyle(s).lineHeight), img: s.querySelector('img').currentSrc.split('/').pop(),
+  return { h: q.height, lh: parseFloat(getComputedStyle(s).lineHeight), img: el.currentSrc.split('/').pop(),
     imgH: img.height, off: img.bottom - base };
 })`;
 const summaryOk = (m) => m.h <= m.lh + 0.5 && Math.abs(m.off) <= 0.5;
@@ -246,65 +275,121 @@ for (const frame of ['desktop-light', 'desktop-dark', 'phone-light', 'phone-dark
 // ---- 2. real README markup
 const body = execFileSync('gh', ['api', 'markdown', '-f', 'text=' + readFileSync(path.join(ROOT, 'README.md'), 'utf8'),
   '-f', 'mode=gfm', '-f', 'context=McDyZzz/McDyZzz']).toString();
+// GitHub's <themed-picture> element (github.com JS chunk "lazy-element-themed-picture"), copied as a page
+// script; the page's ?mode= sets <html data-color-mode>. With "light" or "dark" (a signed-in viewer's
+// explicit theme), in each picture that has a <source> whose media holds "prefers-color-scheme", every
+// <source> is sorted by its media text: "prefers-color-scheme: light" -> light, else
+// "prefers-color-scheme: dark" -> dark, else left alone. Sources of the active theme get a media that
+// always matches, the other theme's get "not all", so any other condition in the same media is lost.
+// "auto" leaves every picture alone.
+const THEMED_PICTURE = `<script>
+const mode = new URLSearchParams(location.search).get('mode') || 'auto';
+document.documentElement.setAttribute('data-color-mode', mode);
+for (const t of document.querySelectorAll('themed-picture')) {
+  const sources = [...t.firstElementChild.querySelectorAll('source')];
+  if (mode === 'auto' || !sources.some((s) => (s.getAttribute('media') ?? '').includes('prefers-color-scheme'))) continue;
+  for (const s of sources) {
+    const media = s.getAttribute('media') ?? '';
+    // As in GitHub's code, String.match turns the string into a RegExp: the parentheses form a group,
+    // so this is a substring test for the text inside them.
+    const theme = media.match('(prefers-color-scheme: light)') ? 'light' : media.match('(prefers-color-scheme: dark)') ? 'dark' : null;
+    if (theme) s.setAttribute('media', theme === mode ? '(prefers-color-scheme: light),(prefers-color-scheme: dark)' : 'not all');
+  }
+}
+</script>`;
 // README width as on github.com/<user>: 846 px from 1280 px up; window - 434 from 1012; window - 370 from 768; window - 82 below.
 const real = `<!doctype html><html><head><meta charset="utf-8"><base href="file://${ROOT}/"><style>
 body{margin:0;font:16px/1.5 sans-serif} .markdown-body{margin:0 auto;width:calc(100vw - 82px)}
 @media (min-width:768px){.markdown-body{width:calc(100vw - 370px)}} @media (min-width:1012px){.markdown-body{width:calc(100vw - 434px)}}
 @media (min-width:1280px){.markdown-body{width:846px}}
 .markdown-body p{margin:0 0 16px} .markdown-body img{max-width:100%;box-sizing:content-box}
-</style></head><body><article class="markdown-body">${body}</article></body></html>`;
+</style></head><body><article class="markdown-body">${body}</article>${THEMED_PICTURE}</body></html>`;
 const realFile = path.join(mkdtempSync(path.join(tmpdir(), 'real-')), 'real.html');
 writeFileSync(realFile, real);
-const expect = (w, scheme) => {
-  const narrow = w <= 1011 ? '-phone' : '';
+// The file each picture pair (keyed by the start of its alt text) must show; null: no image. Every
+// themed image is a phone picture plus a desktop picture; the card back (alt "") is one picture.
+const expect = (w, theme) => {
+  const narrow = w < 1012 ? '-phone' : '';
   return {
-    'About': `h-about${narrow}-${scheme}.svg`,
-    'I build': `about${narrow}-${scheme}.svg`,
-    'Featured projects': `h-project${narrow}-${scheme}.svg`,
-    'idevice-control': `card-idevice-control${narrow}-${scheme}.svg`,
-    'cc-session-breakdown': `card-cc-session-breakdown${narrow}-${scheme}.svg`,
-    '': w >= 1280 ? `card-back-${scheme}.svg` : 'blank.svg',
-    "Don't click this.": `egg-summary${narrow}-${scheme}.svg`,
-    'I taught Claude': `egg-reveal${narrow}-${scheme}.svg`,
+    'About': `h-about${narrow}-${theme}.svg`,
+    'I build': `about${narrow}-${theme}.svg`,
+    'Featured projects': `h-project${narrow}-${theme}.svg`,
+    'idevice-control': `card-idevice-control${narrow}-${theme}.svg`,
+    'cc-session-breakdown': `card-cc-session-breakdown${narrow}-${theme}.svg`,
+    '': w >= 1280 ? `card-back-${theme}.svg` : null,
+    "Don't click this.": `egg-summary${narrow}-${theme}.svg`,
+    'I taught Claude': `egg-reveal${narrow}-${theme}.svg`,
   };
 };
 console.log('\n[real README markup]');
+const pictures = (body.match(/<picture>/g) || []).length;
+const themed = (body.match(/<themed-picture[\s>][^]*?<\/themed-picture>/g) || []).filter((t) => /^<themed-picture[^>]*><picture>[^]*<\/picture><\/themed-picture>$/.test(t)).length;
+check(pictures === 15 && themed === pictures, `GitHub wraps each of the ${pictures} <picture>s in its own <themed-picture> (${themed})`);
 const details = (body.match(/<details>[\s\S]*?<\/details>/) || [''])[0];
 const summaryHtml = (details.match(/<summary>[\s\S]*?<\/summary>/) || [''])[0];
 check(/<picture>[\s\S]*<img [^>]*alt="Don't click this\."[^>]*>[\s\S]*<\/picture>/.test(summaryHtml) && !/<a[\s>]/.test(summaryHtml),
-  `GitHub keeps the summary's <picture> inside <summary>, with no link around the image: ${summaryHtml.replace(/<source[^>]*>/g, '').slice(0, 160)}`);
+  `GitHub keeps the summary's <picture>s inside <summary>, with no link around the images: ${summaryHtml.replace(/<source[^>]*>/g, '').slice(0, 160)}`);
 check(/<\/summary>[\s\S]*<picture>[\s\S]*alt="I taught Claude to tap my iPhone\. Then it wanted the Apple TV remote\. Now it reads my token bills\."/.test(details),
-  'the reveal <picture> follows the summary inside <details>, alt text holds the three lines');
+  'the reveal <picture>s follow the summary inside <details>, alt text holds the three lines');
 const links = (body.match(/<a href="[^"]+"/g) || []).map((a) => a.slice(9, -1));
 check(links.includes('https://github.com/McDyZzz/idevice-control') && links.includes('https://github.com/McDyZzz/cc-session-breakdown'),
   `card links: ${links.filter((l) => /McDyZzz\//.test(l)).join(', ')}`);
-for (const w of [1280, 375, 1100, 900]) {
+for (const w of [1280, 375, 1011.5, 1279.5, 1100, 900]) {
+  const frac = w % 1 !== 0, checked = w === 1280 || w === 375 || frac;
   for (const scheme of ['light', 'dark']) {
-    await b.load('file://' + realFile, w, scheme);
-    const got = await b.eval(`[...document.querySelectorAll('picture img')].map((i) => [i.alt, i.currentSrc.split('/').pop(), i.getBoundingClientRect().width, i.getBoundingClientRect().y])`);
-    const exp = expect(w, scheme);
-    const bad = got.filter(([alt, file]) => { const key = Object.keys(exp).find((k) => k ? alt.startsWith(k) : alt === ''); return exp[key] !== file; });
-    const rows = new Set(got.filter(([alt]) => /^(idevice|cc-session)/.test(alt) || alt === '').filter(([, , wd]) => wd > 0).map(([, , , y]) => Math.round(y))).size;
-    const scroll = await b.eval('document.documentElement.scrollWidth - document.documentElement.clientWidth');
-    const msg = `window ${w} ${scheme}: ${got.length} pictures, ${bad.length ? 'WRONG ' + JSON.stringify(bad) : 'each picks the expected file'}; cards on ${rows} row(s); sideways overflow ${scroll}px`;
-    if (w === 1280 || w === 375) check(bad.length === 0 && scroll <= 0 && (w === 1280 ? rows === 1 : true), msg);
-    else console.log('info ' + msg);
-    if (w !== 1280 && w !== 375) continue;
-    const egg = await b.eval(`(async () => {
-      const summaryLine = ${summaryLine};
-      const d = document.querySelector('details'), s = d.querySelector('summary');
-      const rev = [...d.querySelectorAll('img')].find((i) => !s.contains(i));
-      // Chrome hides closed details content with content-visibility, which keeps its layout boxes:
-      // checkVisibility() tells whether the image is shown.
-      const line = summaryLine(s), shut = rev.checkVisibility();
-      s.click(); await new Promise((r) => setTimeout(r, 200));
-      const open = d.open, shown = rev.checkVisibility() && rev.getBoundingClientRect().width;
-      s.click(); await new Promise((r) => setTimeout(r, 200));
-      return { line, shut, open, shown, closed: !d.open && !rev.checkVisibility() };
-    })()`);
-    check(summaryOk(egg.line), `window ${w} ${scheme}: summary ${summaryMsg(egg.line)}`);
-    check(!egg.shut && egg.open && egg.shown > 0 && egg.closed,
-      `window ${w} ${scheme}: reveal image hidden (${!egg.shut}), shown ${egg.shown}px wide after a click, hidden again after a second click (${egg.closed})`);
+    for (const mode of checked ? ['auto', 'light', 'dark'] : ['auto']) {
+      const url = 'file://' + realFile + '?mode=' + mode;
+      await (frac ? b.loadFramed(url, w, scheme) : b.load(url, w, scheme));
+      const theme = mode === 'auto' ? scheme : mode, label = `window ${w} OS ${scheme} mode ${mode}`;
+      // A fractional width must be the exact CSS viewport, between the whole-pixel gates below and above it.
+      const vp = frac ? await b.eval(`({ iw: innerWidth, exact: matchMedia('(min-width: ${w - 0.01}px) and (max-width: ${w + 0.01}px)').matches,
+        gap: !matchMedia('(max-width: ${Math.floor(w)}px)').matches && !matchMedia('(min-width: ${Math.ceil(w)}px)').matches })`) : null;
+      if (checked) {
+        const egg = await b.eval(`(async () => {
+          const summaryLine = ${summaryLine};
+          const d = document.querySelector('details'), s = d.querySelector('summary');
+          const rev = [...d.querySelectorAll('img')].find((i) => !s.contains(i) && !i.currentSrc.endsWith('/blank.svg'));
+          // Chrome hides closed details content with content-visibility, which keeps its layout boxes:
+          // checkVisibility() tells whether the image is shown.
+          const line = summaryLine(s), shut = rev.checkVisibility();
+          s.click(); await new Promise((r) => setTimeout(r, 200));
+          const open = d.open, shown = rev.checkVisibility() && rev.getBoundingClientRect().width;
+          s.click(); await new Promise((r) => setTimeout(r, 200));
+          return { line, shut, open, shown, closed: !d.open && !rev.checkVisibility() };
+        })()`);
+        check(summaryOk(egg.line), `${label}: summary ${summaryMsg(egg.line)}`);
+        check(!egg.shut && egg.open && egg.shown > 0 && egg.closed,
+          `${label}: reveal image hidden (${!egg.shut}), shown ${egg.shown}px wide after a click, hidden again after a second click (${egg.closed})`);
+      }
+      // With the details open, so the reveal pair is laid out as shown. onLine: another image in the
+      // same block (p, summary or details) is shown and has the same bottom edge, so both sit on one line.
+      const r = await b.eval(`(() => {
+        document.querySelector('details').open = true;
+        const imgs = [...document.querySelectorAll('picture img')], block = (i) => i.closest('summary, p, details');
+        const head = document.querySelector('img[src$="header.svg"]').getBoundingClientRect();
+        return { header: [head.x, head.right], imgs: imgs.map((i) => { const q = i.getBoundingClientRect();
+          return { alt: i.alt, file: i.currentSrc.split('/').pop(), x: q.x, r: q.right, y: q.y, w: q.width, h: q.height,
+            onLine: imgs.some((j) => { const o = j.getBoundingClientRect(); return j !== i && block(j) === block(i) && o.width > 0 && Math.abs(o.bottom - q.bottom) <= 0.5; }) }; }) };
+      })()`);
+      const exp = expect(w, theme), groups = {};
+      for (const g of r.imgs) (groups[Object.keys(exp).find((k) => k ? g.alt.startsWith(k) : g.alt === '')] ??= []).push(g);
+      const bad = Object.keys(groups).filter((k) => !(k in exp)).map((k) => `unexpected alt ${k}`);
+      for (const [key, file] of Object.entries(exp)) {
+        const imgs = groups[key] || [], shown = imgs.filter((i) => i.w > 0 && i.h > 0);
+        const ok = imgs.length === (key ? 2 : 1) && (file ? shown.length === 1 && shown[0].file === file : shown.length === 0) &&
+          imgs.every((i) => shown.includes(i) || (i.file === 'blank.svg' && i.w === 0 && i.h === 0 && i.onLine));
+        if (!ok) bad.push(`${key || 'card back'}: ${imgs.map((i) => `${i.file} ${i.w}x${i.h}${i.w || i.onLine ? '' : ' on its own line'}`).join(' + ')}`);
+      }
+      const cards = r.imgs.filter((g) => (/^(idevice|cc-session)/.test(g.alt) || g.alt === '') && g.w > 0);
+      const rows = new Set(cards.map((g) => Math.round(g.y))).size;
+      const dl = cards[0].x - r.header[0], dr = r.header[1] - cards[cards.length - 1].r;
+      const scroll = await b.eval('document.documentElement.scrollWidth - document.documentElement.clientWidth');
+      if (vp && !(vp.exact && vp.gap)) bad.push(`CSS viewport is not ${w}px between the ${Math.floor(w)} and ${Math.ceil(w)} px gates (innerWidth ${vp.iw})`);
+      const msg = `${label}${vp ? ` (CSS viewport ${w}px, innerWidth ${vp.iw})` : ''}: ${r.imgs.length} pictures, ${bad.length ? 'WRONG ' + bad.join('; ') : 'each pair shows one image, the expected file, and its blank.svg is 0x0 on the same line'}; ` +
+        `cards on ${rows} row(s)${w === 1280 ? `, row edges vs header: left ${dl.toFixed(2)}px, right ${dr.toFixed(2)}px` : ''}; sideways overflow ${scroll}px`;
+      if (checked) check(bad.length === 0 && scroll <= 0 && (w === 1280 ? rows === 1 && Math.abs(dl) <= 4 && Math.abs(dr) <= 4 : true), msg);
+      else console.log('info ' + msg);
+    }
   }
 }
 
@@ -526,7 +611,7 @@ const opened = await b.eval(`(() => {
     const md = sec.querySelector('.markdown-body'), d = md.querySelector('details');
     for (const el of md.children) if (el !== d) el.style.display = 'none';
     d.open = true;
-    const img = [...d.querySelectorAll('img')].find((i) => !d.querySelector('summary').contains(i));
+    const img = [...d.querySelectorAll('img')].find((i) => !d.querySelector('summary').contains(i) && !i.getAttribute('src').endsWith('/blank.svg'));
     out.push([sec.id, img.getAttribute('src').split('/').pop(), img.getBoundingClientRect().width]);
   }
   const g = document.querySelector('.grid').getBoundingClientRect();
