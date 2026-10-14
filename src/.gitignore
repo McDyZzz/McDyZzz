@@ -1,0 +1,7 @@
+# Local-only inputs: the SETI sprite sheet, the official reference photos, earlier designs.
+/local/
+# Preview and check output.
+/index.html
+/shots/
+node_modules/
+__pycache__/
